@@ -1,30 +1,51 @@
-# Two-Body Orbit Propagation: Euler, RK2, RK4 and Adaptive Solvers
+# Two-Body Orbit Propagation: Explicit and Implicit Euler, RK2, RK4 and Adaptive Solvers
 
 ![Orbits and energy drift](figures/orbits_energy.gif)
 
-*Same step size for all methods: Euler spirals outwards and gains energy, RK4 stays on the orbit.*
+*Same step size for all methods: explicit Euler spirals outwards and gains energy, implicit Euler loses energy and falls to the surface (x), RK4 stays on the orbit.*
 
 A small study of numerical integrators on the simplest orbit problem there is: a satellite in a circular low Earth orbit. Because the exact solution is known, every error can be measured precisely, which makes it a clean test bed for comparing methods.
 
 The study covers:
 
 1. the physics and how it becomes an ordinary differential equation (ODE),
-2. three fixed-step integrators written from scratch (Euler, RK2, RK4),
+2. four fixed-step integrators written from scratch: explicit Euler, RK2, RK4, and implicit Euler (with its own Newton solver and LU decomposition),
 3. how their error behaves, measured against the exact solution,
 4. a comparison with SciPy's adaptive solvers (RK45, DOP853).
 
 ```
-orbit_rk.py     physics, integrators, experiments (accuracy and convergence order)
-analysis.py     static figures and the SciPy comparison
-animate.py      animated orbits and energy drift (GIF)
-figures/        generated plots
+orbitsim/                 the library
+    physics.py            two-body ODE, Jacobian, energy, exact circular orbit
+    integrators.py        steppers and the METHODS registry
+    newton.py             Newton's method (used by implicit steppers)
+    linalg.py             LU decomposition (used by Newton)
+    propagate.py          fixed-step driver, optional stop condition
+experiments.py            tables: accuracy and observed order
+analysis.py               static figures and the SciPy comparison
+animate.py                animated orbits and energy drift (GIF)
+tests/
+    unit/                 each module on its own: LU, Newton, Jacobian, steppers, driver
+    integration/          the scripts end to end, figures and GIF into a temp dir
+    regression/           experiment results against stored values (golden.json)
+.github/workflows/        runs all three suites on every push and pull request to main
+figures/                  generated plots
 ```
 
+How the pieces call each other for an implicit step:
+
+```
+propagate  ->  implicit_euler_step  ->  newton_solve  ->  lu_factor / lu_solve
+```
+
+**Adding a method:** write `my_step(ode, t, y, h)` in `orbitsim/integrators.py` and add a `Method(name, my_step, order, color)` to `METHODS`. The experiments, figures, animation and order test pick it up automatically. The regression test will then fail because the set of runs changed: check the new numbers and store them with `uv run pytest tests/regression --update-golden`.
+
 ```bash
-uv sync                 # install dependencies from uv.lock
-uv run orbit_rk.py      # tables: accuracy and observed order
-uv run analysis.py      # figures + SciPy comparison
-uv run animate.py       # figures/orbits_energy.gif
+uv sync                    # install dependencies from uv.lock
+uv run experiments.py      # tables: accuracy and observed order
+uv run analysis.py         # figures + SciPy comparison
+uv run animate.py          # figures/orbits_energy.gif
+uv run pytest              # all tests (unit, integration, regression), about 30 s
+uv run pytest tests/unit   # only the fast unit tests
 ```
 
 ---
@@ -145,7 +166,7 @@ This is what every numerical result is compared against.
 
 ## 2. Numerical integration
 
-All three methods advance the state by a fixed step $h$: from $\mathbf{y}_n \approx \mathbf{y}(t_n)$ they compute $\mathbf{y}_{n+1} \approx \mathbf{y}(t_n + h)$. They differ in how they estimate the average slope over the step.
+All four methods advance the state by a fixed step $h$: from $\mathbf{y}_n \approx \mathbf{y}(t_n)$ they compute $\mathbf{y}_{n+1} \approx \mathbf{y}(t_n + h)$. They differ in how they estimate the average slope over the step.
 
 ### 2.1 Local and global error, and the order of a method
 
@@ -210,7 +231,43 @@ $$
 
 The weights $1:2:2:1$ are the same as in Simpson's rule for integrals; in fact, if $\mathbf{f}$ depends only on $t$, RK4 reduces exactly to Simpson's rule. Four evaluations per step, local error $\sim h^5$, global error $\sim h^4$.
 
-### 2.5 Measuring the order
+### 2.5 Implicit Euler (order 1)
+
+Implicit (backward) Euler uses the slope at the **end** of the step instead of the start:
+
+$$
+\mathbf{y}_{n+1} = \mathbf{y}_n + h\,\mathbf{f}(t_{n+1}, \mathbf{y}_{n+1})
+$$
+
+The unknown $\mathbf{y}_{n+1}$ appears on both sides, so each step means solving a nonlinear system. Writing $\mathbf{z} = \mathbf{y}_{n+1}$:
+
+$$
+\mathbf{G}(\mathbf{z}) = \mathbf{z} - \mathbf{y}_n - h\,\mathbf{f}(t_{n+1}, \mathbf{z}) = \mathbf{0}
+$$
+
+**Newton's method** linearises $\mathbf{G}$ around the current guess and solves for a correction:
+
+$$
+\underbrace{\left(I - h\,J(\mathbf{z})\right)}_{\partial \mathbf{G}/\partial \mathbf{z}}\,\Delta\mathbf{z} = -\mathbf{G}(\mathbf{z}),
+\qquad \mathbf{z} \leftarrow \mathbf{z} + \Delta\mathbf{z}
+$$
+
+starting from an explicit Euler step. It typically converges in 3–4 iterations. The Jacobian of the two-body RHS is
+
+$$
+J = \frac{\partial \mathbf{f}}{\partial \mathbf{y}} =
+\begin{bmatrix} 0 & I \\ A & 0 \end{bmatrix},
+\qquad
+A = \frac{\partial \mathbf{a}}{\partial \mathbf{r}} = -\frac{\mu}{r^3}\left(I - 3\,\frac{\mathbf{r}\mathbf{r}^T}{r^2}\right)
+$$
+
+**The linear solve: LU, not Cholesky.** The Newton matrix $I - hJ$ is not symmetric (the off-diagonal blocks are $-hI$ and $-hA$), so Cholesky does not apply. Each iteration factors it as $PA = LU$ with partial pivoting and solves by forward and back substitution (`orbitsim/linalg.py`). The cost per step is one $\mathbf{f}$ for the initial guess plus, per Newton iteration, one $\mathbf{f}$, one Jacobian and one LU solve.
+
+**Why implicit Euler spirals inwards.** For an oscillation with frequency $\omega$, implicit Euler multiplies the amplitude by $1/\sqrt{1 + h^2\omega^2}$ every step: it acts like friction. The orbit loses energy and shrinks. Unlike explicit Euler's outward spiral, this runs away: a lower orbit has a larger $\omega = \sqrt{\mu/r^3}$, so the damping per step grows as the satellite falls. Explicit Euler limits itself instead, because a higher orbit has a smaller $\omega$.
+
+The lesson: implicit methods buy **stability** for stiff, dissipative problems. They do not buy accuracy, and for an oscillatory, energy-conserving problem like an orbit, their numerical damping is the wrong behaviour.
+
+### 2.6 Measuring the order
 
 If the error behaves like $e(h) \approx C\,h^p$, then halving the step gives
 
@@ -228,47 +285,57 @@ This only holds in the **asymptotic regime**, where $h$ is small enough that the
 
 ## 3. Results
 
-### 3.1 Accuracy after 10 orbits (`orbit_rk.py`, experiment 1)
+### 3.1 Accuracy after 10 orbits (`experiments.py`, experiment 1)
 
-Position error against the exact solution and relative energy drift $|E - E_0|/|E_0|$, after 10 orbits (about 15.4 hours):
+Position error against the exact solution and signed relative energy change $(E - E_0)/|E_0|$ after 10 orbits (about 15.4 hours). Positive means the orbit gained energy (spiralled outwards), negative that it lost energy. Runs stop if the satellite hits the surface.
 
-| Method | $h$ [s] | f-evaluations | Position error [km] | Relative energy drift |
-|---|---:|---:|---:|---:|
-| Euler | 60 | 926 | 12 180 | 6.7e-01 |
-| Euler | 30 | 1 851 | 14 550 | 5.9e-01 |
-| Euler | 10 | 5 554 | 5 879 | 4.2e-01 |
-| RK2 | 60 | 1 852 | 1 887 | 2.4e-03 |
-| RK2 | 30 | 3 702 | 383 | 3.1e-04 |
-| RK2 | 10 | 11 108 | 35.4 | 1.1e-05 |
-| RK4 | 60 | 3 704 | 1.01 | 2.5e-06 |
-| RK4 | 30 | 7 404 | 0.038 | 7.9e-08 |
-| RK4 | 10 | 22 216 | 0.00026 | 3.2e-10 |
+| Method | $h$ [s] | f-evaluations | J-evaluations | Position error [km] | Relative energy change |
+|---|---:|---:|---:|---:|---:|
+| Euler | 60 | 926 | 0 | 12 180 | +6.7e-01 |
+| Euler | 30 | 1 851 | 0 | 14 550 | +5.9e-01 |
+| Euler | 10 | 5 554 | 0 | 5 879 | +4.2e-01 |
+| Implicit Euler | 60 | 64 | 48 | surface after 0.17 orbits | −1.6e-01 |
+| Implicit Euler | 30 | 184 | 138 | surface after 0.25 orbits | −1.1e-01 |
+| Implicit Euler | 10 | 980 | 735 | surface after 0.44 orbits | −6.8e-02 |
+| RK2 | 60 | 1 852 | 0 | 1 887 | +2.4e-03 |
+| RK2 | 30 | 3 702 | 0 | 383 | +3.1e-04 |
+| RK2 | 10 | 11 108 | 0 | 35.4 | +1.1e-05 |
+| RK4 | 60 | 3 704 | 0 | 1.01 | −2.5e-06 |
+| RK4 | 30 | 7 404 | 0 | 0.038 | −7.9e-08 |
+| RK4 | 10 | 22 216 | 0 | 0.00026 | −3.2e-10 |
 
 **Same cost, very different accuracy.** At about 3 700 evaluations, RK2 ($h = 30$ s) is off by 383 km, RK4 ($h = 60$ s) by 1 km. Doing more work per step pays off by orders of magnitude.
 
-**Energy drift.** With $h = 60$ s, Euler raises the energy by 67 %: since $E = -\mu/(2a)$, the semi-major axis has roughly tripled, to about 20 000 km. RK4 with $h = 10$ s keeps the energy constant to $3 \times 10^{-10}$.
+**Energy drift.** With $h = 60$ s, Euler raises the energy by 67 %: since $E = -\mu/(2a)$, the semi-major axis has roughly tripled, to about 20 000 km. RK4 with $h = 10$ s keeps the energy constant to $3 \times 10^{-10}$ (and, like implicit Euler, drifts slightly downwards).
+
+**Implicit Euler falls.** It never completes even half an orbit at these step sizes. It survives roughly $4/h$ orbits ($h$ in seconds): it needs $h \lesssim 0.4$ s to last 10 orbits, and even at $h = 0.25$ s it loses about 250 km of altitude over those 10 orbits.
 
 **Euler's errors saturate.** Errors of 6 000 to 15 000 km are as large as the orbit itself, so the numbers no longer mean much; that is also why $h = 30$ s gives a *larger* error than $h = 60$ s.
 
 ![Orbits](figures/orbits.png)
 
-*Three orbits with $h = 60$ s: Euler spirals outwards, RK2 and RK4 stay on the exact orbit.*
+*Three orbits with $h = 60$ s: Euler spirals outwards, implicit Euler falls to the surface within a fifth of an orbit (x), RK2 and RK4 stay on the exact orbit.*
 
-### 3.2 Observed order of convergence (`orbit_rk.py`, experiment 2)
+![Altitude](figures/altitude.png)
 
-Error after one orbit for step sizes $h = 240, 120, 60, 30, 15$ s, and the order estimated from each halving:
+*Altitude over time with $h = 5$ s: explicit and implicit Euler leave the orbit in opposite directions; RK2 and RK4 lie on the exact altitude.*
+
+### 3.2 Observed order of convergence (`experiments.py`, experiment 2)
+
+Error after one orbit for step sizes $h = 240, 120, \dots, 0.9375$ s (each half the previous), and the order estimated from each halving. A run that hits the surface before completing the orbit has no error to measure ("–"):
 
 | Method | Observed order |
 |---|---|
-| Euler | 0.40, 0.50, 0.64, 0.79 |
-| RK2 | 1.93, 2.06, 2.01, 2.02 |
-| RK4 | 4.52, 4.42, 4.18, 4.12 |
+| Euler | 0.40, 0.50, 0.64, 0.79, 0.89, 0.94, 0.97, 0.99 |
+| Implicit Euler | –, –, –, –, –, –, 1.03, 1.01 |
+| RK2 | 1.93, 2.06, 2.01, 2.02, 2.01, 2.01, 2.00, 2.00 |
+| RK4 | 4.52, 4.42, 4.18, 4.12, 4.07, 4.04, 4.02, 4.35 |
 
-RK2 and RK4 match the theory (2 and 4). RK4 is slightly above 4 at large steps, where higher-order terms still contribute, and approaches 4 as $h$ shrinks. Euler is not yet in the asymptotic regime at these step sizes; its observed order rises towards 1 as $h$ decreases.
+All four methods match the theory. RK4 is slightly above 4 at large steps, where higher-order terms still contribute, and approaches 4 as $h$ shrinks; the last value (4.35) is where its error reaches about $10^{-9}$ km and round-off starts to matter. Explicit Euler needs small steps to reach the asymptotic regime; its observed order rises towards 1 as $h$ decreases. Implicit Euler only completes the orbit for $h \le 3.75$ s, and is first order there; its error is almost the same size as explicit Euler's, with the opposite sign of energy change.
 
 ![Convergence](figures/convergence.png)
 
-*Error after one orbit against step size. The slope of each line is the order of the method; dashed lines show slopes 1, 2 and 4.*
+*Error after one orbit against step size. The slope of each line is the order of the method; dashed lines show slopes 1, 2 and 4. Implicit Euler only has points where it completes the orbit.*
 
 ---
 
@@ -317,7 +384,7 @@ with a safety factor $s < 1$. If the error is too large, the step is rejected an
 
 ![Accuracy vs cost](figures/accuracy_vs_cost.png)
 
-*Position error after 10 orbits against the number of function evaluations, for all methods.*
+*Position error after 10 orbits against the number of function evaluations. Implicit Euler hits the surface for every step size tested here ($h \ge 7.5$ s), so it has no points.*
 
 ### 4.3 What this shows
 
