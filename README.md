@@ -1,5 +1,7 @@
 # Two-Body Orbit Propagation: Explicit and Implicit Euler, RK2, RK4 and Adaptive Solvers
 
+[![tests](https://github.com/catalina-urizar-kleinknecht/orbit-propagation/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/catalina-urizar-kleinknecht/orbit-propagation/actions/workflows/tests.yml)
+
 ![Orbits and energy drift](figures/orbits_energy.gif)
 
 *Same step size for all methods: explicit Euler spirals outwards and gains energy, implicit Euler loses energy and falls to the surface (x), RK4 stays on the orbit.*
@@ -414,6 +416,32 @@ Each of these is one more term in $\mathbf{f}(t, \mathbf{y})$; the integrators t
 
 Planned next steps:
 
+- **Symplectic (semi-implicit) Euler and Verlet:** as cheap as explicit Euler, but the energy error stays bounded instead of drifting either way.
 - **Eccentric orbit:** compare fixed and adaptive step size where it matters.
 - **Earth rotation and ground points:** convert between inertial and Earth-fixed coordinates.
 - **Access windows:** compute when a satellite is above a minimum elevation angle for a point on the ground, and how often a constellation revisits an area.
+
+---
+
+## 6. Testing and continuous integration
+
+```bash
+uv run pytest                    # everything, about 30 s
+uv run pytest tests/unit         # one suite
+```
+
+| Suite | What it checks |
+|---|---|
+| `tests/unit/` | Each module in isolation: LU against NumPy (with pivoting and singular matrices), Newton (convergence and failure), the Jacobian against finite differences, the observed order of every method in `METHODS`, the driver's stop condition and evaluation counts. |
+| `tests/integration/` | The scripts end to end: the experiments, all figures and the GIF are produced (into a temporary directory), and the physics comes out right: explicit Euler gains energy, implicit Euler loses it and hits the surface, RK4 stays on the orbit. |
+| `tests/regression/` | Every number from the experiments (cost, error, energy change, surface hits) against the stored reference `tests/regression/golden.json`. Any change in numerical behaviour shows up here, with a list of all values that moved. |
+
+**Updating the reference.** After an intended change (a new method, other step sizes), check the new numbers and store them:
+
+```bash
+uv run pytest tests/regression --update-golden
+```
+
+**Why the regression tolerances are not zero.** NumPy's OpenBLAS chooses CPU-specific kernels (for example AVX-512 on GitHub's runners), which round differently in the last bit. Over thousands of steps this grows to about $N \varepsilon |\mathbf{r}| \approx 10^{-8}$ km. The first CI run showed exactly this: RK4's error after 10 orbits differed by 1.4 µm from the value computed on a laptop. The tolerances (relative $10^{-6}$, absolute $10^{-7}$ km for positions) sit above that floor, far below any real change. To check locally against another CPU's kernel, e.g. on Linux: `OPENBLAS_CORETYPE=SkylakeX uv run pytest tests/regression`.
+
+**CI.** `.github/workflows/tests.yml` runs the three suites as separate steps on every push and pull request to `main` (and manually from the Actions tab). The badge at the top shows the result of the latest run on `main`; the details are under the repository's **Actions** tab.
